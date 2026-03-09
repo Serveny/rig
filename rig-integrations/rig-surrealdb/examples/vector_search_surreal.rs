@@ -6,7 +6,7 @@ use rig::{
     embeddings::EmbeddingsBuilder,
     vector_store::{InsertDocuments, VectorStoreIndex},
 };
-use rig_surrealdb::{Mem, SurrealVectorStore};
+use rig_surrealdb::{Mem, SurrealSearchFilter, SurrealVectorStore};
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 
@@ -27,6 +27,18 @@ impl std::fmt::Display for WordDefinition {
     }
 }
 
+fn threshold_request(
+    query: &str,
+    samples: u64,
+    threshold: f64,
+) -> Result<VectorSearchRequest<SurrealSearchFilter>, rig::vector_store::VectorStoreError> {
+    VectorSearchRequest::builder()
+        .query(query)
+        .samples(samples)
+        .threshold(threshold)
+        .build()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
@@ -34,8 +46,21 @@ async fn main() -> Result<(), anyhow::Error> {
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
 
     let surreal = Surreal::new::<Mem>(()).await?;
-
     surreal.use_ns("example").use_db("example").await?;
+
+    // Keep the in-memory example self-contained by defining the schema inline.
+    // For a persistent SurrealDB 3 deployment, apply `examples/migrations.surql`
+    // ahead of time instead of creating schema during application startup.
+    surreal
+        .query(
+            "DEFINE TABLE documents SCHEMAFULL;\
+             DEFINE FIELD document ON TABLE documents TYPE object FLEXIBLE;\
+             DEFINE FIELD embedding ON TABLE documents TYPE array<float>;\
+             DEFINE FIELD embedded_text ON TABLE documents TYPE string;\
+             DEFINE INDEX IF NOT EXISTS words_embedding_vector_index ON documents \
+             FIELDS embedding HNSW DIMENSION 1536 DIST COSINE;",
+        )
+        .await?;
 
     // create test documents with mocked embeddings
     let words = vec![
@@ -53,11 +78,9 @@ async fn main() -> Result<(), anyhow::Error> {
         }];
 
     let documents = EmbeddingsBuilder::new(model.clone())
-        .documents(words)
-        .unwrap()
+        .documents(words)?
         .build()
-        .await
-        .expect("Failed to create embeddings");
+        .await?;
 
     // init vector store
     let vector_store = SurrealVectorStore::with_defaults(model, surreal);
@@ -80,22 +103,25 @@ async fn main() -> Result<(), anyhow::Error> {
         println!("Result distance {distance} for word: {doc}");
     }
 
-    // Use the midpoint as similarity threshold to guarantee exactly one result is returned.
-    let midpoint = (results[0].0 + results[1].0) / 2.0;
-
-    println!(
-        "Attempting vector search with cosine similarity threshold of {midpoint} and query: {query}"
-    );
     let req = VectorSearchRequest::builder()
         .query(query)
         .samples(2)
-        .threshold(midpoint)
         .build()?;
+
+    let id_results = vector_store.top_n_ids(req).await?;
+    println!("Top result ids: {id_results:?}");
+
+    // This fixed threshold only demonstrates the API shape; live model distances vary.
+    let threshold = 0.25;
+
+    println!(
+        "Attempting vector search with cosine distance threshold of {threshold} and query: {query}"
+    );
+    let req = threshold_request(query, 2, threshold)?;
 
     let results = vector_store.top_n::<WordDefinition>(req).await?;
 
     println!("{} results for query: {}", results.len(), query);
-    assert_eq!(results.len(), 1);
 
     for (distance, _id, doc) in results.iter() {
         println!("Result distance {distance} for word: {doc}");
